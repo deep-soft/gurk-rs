@@ -1,0 +1,58 @@
+diff --git a/src/config.rs b/src/config.rs
+index 358cce9..9d37e23 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -63,6 +63,9 @@ pub struct Config {
+     /// Whether to enable the default keybindings
+     #[serde(default = "default_true")]
+     pub default_keybindings: bool,
++    #[serde(default)]
++    /// default url for is online
++    pub is_online_url: String,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+@@ -136,6 +139,7 @@ impl Config {
+             colored_messages: false,
+             default_keybindings: true,
+             keybindings: ModeKeybindingConfig::default(),
++            is_online_url: "detectportal.firefox.com:80".to_string(),
+         }
+     }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index 584f753..3fbfcac 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -96,8 +96,11 @@ fn main() -> anyhow::Result<()> {
+     runtime.block_on(run(config, passphrase, args.relink))
+ }
+ 
+-async fn is_online() -> bool {
+-    tokio::net::TcpStream::connect("detectportal.firefox.com:80")
++async fn is_online(config: Config) -> bool {
++//    tokio::net::TcpStream::connect("detectportal.firefox.com:80")
++    let iou = config.is_online_url;
++    println!("->is_online_url:[{iou}]");
++    tokio::net::TcpStream::connect(iou)
+         .await
+         .is_ok()
+ }
+@@ -157,7 +160,7 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
+ 
+     sync_from_signal(&*signal_manager, &mut *storage).await;
+ 
+-    let (mut app, mut app_events) = App::try_new(config, signal_manager.clone_boxed(), storage)?;
++    let (mut app, mut app_events) = App::try_new(config.clone(), signal_manager.clone_boxed(), storage)?;
+     app.populate_names_cache().await;
+ 
+     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(100);
+@@ -184,7 +187,7 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
+     local_pool.spawn_pinned(|| async move {
+         let mut backoff = Backoff::new();
+         loop {
+-            let mut messages = if !is_online().await {
++            let mut messages = if !is_online(config.clone()).await {
+                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                 continue;
+             } else {
