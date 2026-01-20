@@ -8,7 +8,6 @@ use std::path::Path;
 
 use anyhow::{Context as _, anyhow};
 use arboard::{Clipboard, ImageData};
-use chrono::Datelike;
 use chrono::{DateTime, Local, TimeZone};
 use crokey::Combiner;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -44,7 +43,6 @@ use crate::signal::{
     SignalManager,
 };
 use crate::storage::{MessageId, Storage};
-use crate::util::utc_timestamp_msec_to_local;
 use crate::util::{self, ATTACHMENT_REGEX, StatefulList, URL_REGEX};
 
 pub struct App {
@@ -360,19 +358,18 @@ impl App {
                             // input is empty
                             self.try_open_url_or_file();
                         }
-                    } else if self.select_channel.is_shown {
-                        if let Some(channel_id) = self.select_channel.selected_channel_id().copied()
-                        {
-                            self.select_channel.is_shown = false;
-                            let (idx, _) = self
-                                .channels
-                                .items
-                                .iter()
-                                .enumerate()
-                                .find(|(_, id)| **id == channel_id)
-                                .context("channel disappeared during channel select popup")?;
-                            self.channels.state.select(Some(idx));
-                        }
+                    } else if self.select_channel.is_shown
+                        && let Some(channel_id) = self.select_channel.selected_channel_id().copied()
+                    {
+                        self.select_channel.is_shown = false;
+                        let (idx, _) = self
+                            .channels
+                            .items
+                            .iter()
+                            .enumerate()
+                            .find(|(_, id)| **id == channel_id)
+                            .context("channel disappeared during channel select popup")?;
+                        self.channels.state.select(Some(idx));
                     }
                 }
                 KeyCode::Esc => {
@@ -412,58 +409,22 @@ impl App {
     }
 
     fn selected_message_id(&self) -> Option<MessageId> {
-        // Messages are shown in reversed order => selected is reversed
         let channel_id = self.channels.selected_item()?;
         let messages = self.messages.get(channel_id)?;
-
-        if messages.items.is_empty() {
-            return None;
-        }
-
-        // Track UI positions to match rendering logic
-        let uncorrected_ui_idx = messages.state.selected()?;
-        let mut ui_position = 0;
-        let mut message_idx = messages.items.len() - 1; // Start with newest
-
-        // Initialize to newest message's day (like rendering does in draw.rs)
-        let mut previous_msg_day =
-            utc_timestamp_msec_to_local(messages.items[message_idx]).num_days_from_ce();
-
-        loop {
-            let arrived_at = messages.items[message_idx];
-            let current_day = utc_timestamp_msec_to_local(arrived_at).num_days_from_ce();
-
-            // Check if this message would have a separator before it
-            if current_day != previous_msg_day {
-                // A separator exists at this UI position
-                if ui_position == uncorrected_ui_idx {
-                    // User selected the separator itself, return the message after it
-                    return Some(MessageId::new(*channel_id, arrived_at));
-                }
-                ui_position += 1;
-                previous_msg_day = current_day;
-            }
-
-            // The message is at this UI position
-            if ui_position == uncorrected_ui_idx {
-                return Some(MessageId::new(*channel_id, arrived_at));
-            }
-            ui_position += 1;
-
-            // Move to next older message
-            if message_idx == 0 {
-                break;
-            }
-            message_idx -= 1;
-        }
-
-        // UI position beyond available messages
-        None
+        let message_idx = messages.state.selected()?;
+        let arrived_at = messages.items[messages
+            .items
+            .len()
+            .checked_sub(message_idx)?
+            .checked_sub(1)?];
+        Some(MessageId::new(*channel_id, arrived_at))
     }
 
     fn selected_message(&self) -> Option<Cow<'_, Message>> {
         let message_id = self.selected_message_id()?;
-        self.storage.message(message_id)
+        let message = self.storage.message(message_id);
+        info!("selected message: {message:?}");
+        message
     }
 
     /// Returns Some(_) reaction if input is a reaction.
@@ -523,11 +484,11 @@ impl App {
     }
 
     fn reset_message_selection(&mut self) {
-        if let Some(channel_id) = self.channels.selected_item() {
-            if let Some(messages) = self.messages.get_mut(channel_id) {
-                messages.state.select(None);
-                messages.rendered = Default::default();
-            }
+        if let Some(channel_id) = self.channels.selected_item()
+            && let Some(messages) = self.messages.get_mut(channel_id)
+        {
+            messages.state.select(None);
+            messages.rendered = Default::default();
         }
     }
 
@@ -599,6 +560,7 @@ impl App {
                 .get_mut(channel_id)
                 .expect("non-existent channel")
                 .next();
+            self.selected_message();
         }
     }
 
@@ -612,14 +574,13 @@ impl App {
     }
 
     pub fn reset_unread_messages(&mut self) {
-        if let Some(channel_id) = self.channels.selected_item() {
-            if let Some(channel) = self.storage.channel(*channel_id) {
-                if channel.unread_messages > 0 {
-                    let mut channel = channel.into_owned();
-                    channel.unread_messages = 0;
-                    self.storage.store_channel(channel);
-                }
-            }
+        if let Some(channel_id) = self.channels.selected_item()
+            && let Some(channel) = self.storage.channel(*channel_id)
+            && channel.unread_messages > 0
+        {
+            let mut channel = channel.into_owned();
+            channel.unread_messages = 0;
+            self.storage.store_channel(channel);
         }
     }
 
@@ -627,10 +588,10 @@ impl App {
         // tracing::info!(?content, "incoming");
 
         #[cfg(feature = "dev")]
-        if self.config.developer.dump_raw_messages {
-            if let Err(e) = crate::dev::dump_raw_message(&content) {
-                warn!(error = %e, "failed to dump raw message");
-            }
+        if self.config.developer.dump_raw_messages
+            && let Err(e) = crate::dev::dump_raw_message(&content)
+        {
+            warn!(error = %e, "failed to dump raw message");
         }
 
         let user_id = self.user_id;
@@ -1421,8 +1382,8 @@ impl App {
     }
 
     fn notify(&self, summary: &str, text: &str) {
-        if self.config.notifications.enabled {
-            if let Err(e) = Notification::new()
+        if self.config.notifications.enabled
+            && let Err(e) = Notification::new()
                 .summary(if self.config.notifications.show_message_chat {
                     summary
                 } else {
@@ -1434,9 +1395,8 @@ impl App {
                     "New message!"
                 })
                 .show()
-            {
-                error!("failed to send notification: {}", e);
-            }
+        {
+            error!("failed to send notification: {}", e);
         }
     }
 
@@ -1569,15 +1529,15 @@ impl App {
     }
 
     pub fn copy_selection(&mut self) {
-        if let Some(message) = self.selected_message() {
-            if let Some(text) = message.message.as_ref() {
-                let text = text.clone();
-                if let Some(clipboard) = self.clipboard.as_mut() {
-                    if let Err(error) = clipboard.set_text(text) {
-                        error!(%error, "failed to copy text to clipboard");
-                    } else {
-                        info!("copied selected text to clipboard");
-                    }
+        if let Some(message) = self.selected_message()
+            && let Some(text) = message.message.as_ref()
+        {
+            let text = text.clone();
+            if let Some(clipboard) = self.clipboard.as_mut() {
+                if let Err(error) = clipboard.set_text(text) {
+                    error!(%error, "failed to copy text to clipboard");
+                } else {
+                    info!("copied selected text to clipboard");
                 }
             }
         }
@@ -1620,7 +1580,6 @@ impl App {
 
         let message_id = self.selected_message_id()?;
         let message = self.storage.message(message_id)?;
-
         if message.from_id != self.user_id {
             return None;
         }
@@ -1664,10 +1623,10 @@ impl App {
             vec![WindowMode::Anywhere, WindowMode::Normal]
         };
         for mode in modes {
-            if let Some(kb) = self.mode_keybindings.get(&mode) {
-                if let Some(cmd) = kb.get(&keys_pressed) {
-                    return Some(cmd);
-                }
+            if let Some(kb) = self.mode_keybindings.get(&mode)
+                && let Some(cmd) = kb.get(&keys_pressed)
+            {
+                return Some(cmd);
             }
         }
         if self.is_help() {
