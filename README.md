@@ -95,7 +95,7 @@ libraries that are not available on crates.io.
   * `ctrl+c` Quit.
 * Message input
   * `tab` Send emoji from input line as reaction on selected message.
-  * `alt+enter` Switch between multi-line and singl-line input modes.
+  * `alt+enter` Switch between multi-line and single-line input modes.
   * `alt+left`, `alt+right` Jump to previous/next word.
   * `ctrl+w / ctrl+backspace / alt+backspace` Delete last word.
   * `ctrl+u` Delete to the start of the line.
@@ -117,6 +117,7 @@ libraries that are not available on crates.io.
   * `ctrl+j / Up` Select previous channel.
   * `ctrl+k / Down` Select next channel.
   * `ctrl+p` Open / close channel selection popup.
+  * `alt+m` Toggle mute for the selected channel (silences notifications; muted channels are marked with `[M]`).
 * Clipboard
   * `alt+y` Copy selected message to clipboard.
 * Help menu
@@ -166,10 +167,11 @@ kill_word
 copy_message selected
 beginning_of_line
 end_of_line
-delete_character previous
+delete_character previous|next
 edit_message
 open_url
 open_file
+toggle_mute_channel
 ```
 
 ### Example configuration

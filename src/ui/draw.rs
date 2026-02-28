@@ -111,9 +111,12 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 String::new()
             };
-            let label = format!("{}{}", app.channel_name(&channel), unread_messages_label);
+            let mute_label = if channel.muted { " [M]" } else { "" };
+            let suffix = format!("{unread_messages_label}{mute_label}");
+            let channel_name = app.channel_name(&channel);
+            let label = format!("{channel_name}{suffix}");
             let label_width = label.width();
-            let label = if label.width() <= channel_list_width || unread_messages_label.is_empty() {
+            let label = if label_width <= channel_list_width || suffix.is_empty() {
                 label
             } else {
                 let diff = label_width - channel_list_width;
@@ -121,7 +124,7 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
                 while !channel.name.is_char_boundary(end) {
                     end += 1;
                 }
-                format!("{}{}", &channel.name[0..end], unread_messages_label)
+                format!("{}{}", &channel.name[0..end], suffix)
             };
             ListItem::new(vec![Line::from(Span::raw(label))])
         });
@@ -330,12 +333,10 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
             .clone()
             .map(|arrived_at| MessageId::new(channel_id, arrived_at)),
     );
-    let max_username_width = names.max_name_width();
 
     // message display options
     const TIME_WIDTH: usize = 6; // width of "00:00 "
-    const DELIMITER_WIDTH: usize = 2;
-    let mut prefix_width = TIME_WIDTH + max_username_width + DELIMITER_WIDTH;
+    let mut prefix_width = TIME_WIDTH;
     if app.config.show_receipts {
         prefix_width += RECEIPT_WIDTH;
     }
@@ -346,29 +347,41 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let mut previous_msg_timestamp = first_msg_timestamp;
     let mut previous_msg_day = utc_timestamp_msec_to_local(first_msg_timestamp).num_days_from_ce();
 
-    let messages_from_offset = messages_to_render.flat_map(|arrived_at| {
-        let msg = app
-            .storage
-            .message(MessageId::new(channel_id, arrived_at))?;
-        let date_division = display_date_line(
-            msg.arrived_at,
-            previous_msg_timestamp,
-            &mut previous_msg_day,
-            width,
-        );
-        previous_msg_timestamp = msg.arrived_at;
-        let show_receipt = ShowReceipt::from_msg(&msg, app.user_id, app.config.show_receipts);
-        display_message(
-            &names,
-            &msg,
-            &prefix,
-            width,
-            height,
-            show_receipt,
-            date_division,
-            app.config.colored_messages,
-        )
-    });
+    let messages_from_offset = messages_to_render
+        .enumerate()
+        .flat_map(|(idx, arrived_at)| {
+            let msg = app
+                .storage
+                .message(MessageId::new(channel_id, arrived_at))?;
+            let date_division = display_date_line(
+                msg.arrived_at,
+                previous_msg_timestamp,
+                &mut previous_msg_day,
+                width,
+            );
+
+            let unread_messages = channel.unread_messages as usize;
+            let new_messages_division =
+                (unread_messages > 0 && unread_messages == idx + 1).then(|| {
+                    "-".repeat(prefix_width)
+                        + "new messages"
+                        + &"-".repeat(width.saturating_sub(prefix_width))
+                });
+
+            previous_msg_timestamp = msg.arrived_at;
+            let show_receipt = ShowReceipt::from_msg(&msg, app.user_id, app.config.show_receipts);
+            display_message(
+                &names,
+                &msg,
+                &prefix,
+                width,
+                height,
+                show_receipt,
+                date_division,
+                new_messages_division,
+                app.config.colored_messages,
+            )
+        });
 
     // counters to accumulate messages as long they fit into the list height,
     // or up to the selected message
@@ -398,15 +411,6 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let offset = offset + first_idx;
     items = items.split_off(first_idx);
-
-    // add unread messages line
-    let unread_messages = channel.unread_messages as usize;
-    if unread_messages > 0 && unread_messages < items.len() {
-        let new_message_line = "-".repeat(prefix_width)
-            + "new messages"
-            + &"-".repeat(width.saturating_sub(prefix_width));
-        items.insert(unread_messages, ListItem::new(Span::from(new_message_line)));
-    }
 
     let title: String = if let Some(writing_people) = writing_people {
         format!("Messages {writing_people}")
@@ -492,6 +496,7 @@ fn display_message(
     height: usize,
     show_receipt: ShowReceipt,
     date_division: Option<String>,
+    unread_messages_division: Option<String>,
     colored_messages: bool,
 ) -> Option<ListItem<'static>> {
     let receipt = Span::styled(
@@ -506,23 +511,9 @@ fn display_message(
 
     let (from, from_color) = names.resolve(msg.from_id);
 
-    let from = Span::styled(
-        textwrap::indent(
-            &from,
-            &" ".repeat(
-                names
-                    .max_name_width()
-                    .checked_sub(from.width())
-                    .unwrap_or_default(),
-            ),
-        ),
-        Style::default().fg(from_color),
-    );
+    let from_width = from.width();
+    let from = Span::styled(from.into_owned(), Style::default().fg(from_color));
     let delimiter = Span::from(": ");
-
-    let wrap_opts = textwrap::Options::new(width)
-        .initial_indent(prefix)
-        .subsequent_indent(prefix);
 
     // collect message text
     let text = strip_ansi_escapes::strip_str(msg.message.as_deref().unwrap_or_default());
@@ -538,6 +529,9 @@ fn display_message(
     if let Some(date_division) = date_division {
         spans.push(Line::from(date_division));
     }
+    if let Some(unread_messages_division) = unread_messages_division {
+        spans.push(Line::from(unread_messages_division));
+    }
 
     // prepend quote if any
     let quote_text = msg
@@ -550,50 +544,59 @@ fn display_message(
             .initial_indent(&quote_prefix)
             .subsequent_indent(&quote_prefix);
         let quote_style = Style::default().fg(Color::Rgb(150, 150, 150));
-        spans = textwrap::wrap(quote_text, quote_wrap_opts)
-            .into_iter()
-            .enumerate()
-            .map(|(idx, line)| {
-                let res = if idx == 0 {
-                    vec![
-                        receipt.clone(),
-                        time.clone(),
-                        from.clone(),
-                        delimiter.clone(),
-                        Span::styled(line.strip_prefix(prefix).unwrap().to_owned(), quote_style),
-                    ]
-                } else {
-                    vec![Span::styled(line.into_owned(), quote_style)]
-                };
-                Line::from(res)
-            })
-            .collect();
+        spans.extend(
+            textwrap::wrap(quote_text, quote_wrap_opts)
+                .into_iter()
+                .enumerate()
+                .map(|(idx, line)| {
+                    let res = if idx == 0 {
+                        vec![
+                            receipt.clone(),
+                            time.clone(),
+                            from.clone(),
+                            delimiter.clone(),
+                            Span::styled(
+                                line.strip_prefix(prefix).unwrap().to_owned(),
+                                quote_style,
+                            ),
+                        ]
+                    } else {
+                        vec![Span::styled(line.into_owned(), quote_style)]
+                    };
+                    Line::from(res)
+                }),
+        );
     }
 
-    let add_time = spans.is_empty();
+    let add_time = quote_text.is_none();
     let message_style = if colored_messages {
         Style::default().fg(from_color)
     } else {
         Style::default()
     };
+
+    const DELIMITER_WIDTH: usize = 2;
+    let first_line_prefix = " ".repeat(prefix.len() + from_width + DELIMITER_WIDTH);
+    let wrap_opts = textwrap::Options::new(width)
+        .initial_indent(if add_time { &first_line_prefix } else { prefix })
+        .subsequent_indent(prefix);
+    let mut wrapped_text = textwrap::wrap(&text, &wrap_opts).into_iter();
+
+    if add_time && let Some(first_line) = wrapped_text.next() {
+        let line = first_line
+            .strip_prefix(&first_line_prefix)
+            .expect("logic error")
+            .to_owned();
+        spans.push(Line::from(vec![
+            receipt,
+            time,
+            from,
+            delimiter,
+            Span::styled(line, message_style),
+        ]));
+    }
     spans.extend(
-        textwrap::wrap(&text, &wrap_opts)
-            .into_iter()
-            .enumerate()
-            .map(|(idx, line)| {
-                let res = if add_time && idx == 0 {
-                    vec![
-                        receipt.clone(),
-                        time.clone(),
-                        from.clone(),
-                        delimiter.clone(),
-                        Span::styled(line.strip_prefix(prefix).unwrap().to_owned(), message_style),
-                    ]
-                } else {
-                    vec![Span::styled(line.into_owned(), message_style)]
-                };
-                Line::from(res)
-            }),
+        wrapped_text.map(|line| Line::from(Span::styled(line.into_owned(), message_style))),
     );
 
     if let Some(reason) = msg.send_failed.as_deref() {
@@ -778,8 +781,31 @@ fn bindings_mode<'a>(app: &App, mode: &WindowMode) -> Vec<Line<'a>> {
     v
 }
 
+fn help_indicators<'a>() -> Vec<Line<'a>> {
+    let indicators: &[(&str, &str)] = &[
+        ("(N)", "N unread messages in channel"),
+        ("[M]", "Channel is muted (notifications silenced)"),
+        ("○", "Message sent"),
+        ("◉", "Message delivered"),
+        ("●", "Message read"),
+    ];
+    let label_len = indicators.iter().map(|i| i.0.len()).max().unwrap_or(0);
+    let mut v = vec![
+        Line::default(),
+        Line::styled("Indicators", Style::default().add_modifier(Modifier::BOLD)),
+        Line::default(),
+    ];
+    v.extend(
+        indicators
+            .iter()
+            .map(|i| Line::raw(format!("{: <label_len$}   {}", i.0, i.1))),
+    );
+    v
+}
+
 fn draw_help(f: &mut Frame, app: &mut App, area: Rect) {
     let mut command_bindings = help_commands();
+    command_bindings.extend(help_indicators());
     command_bindings.extend(bindings(app));
     let command_bindings = Paragraph::new(Text::from(command_bindings))
         .block(Block::bordered().title("Available commands and configured shortcuts"))
@@ -877,6 +903,7 @@ mod tests {
             HEIGHT,
             ShowReceipt::Never,
             None,
+            None,
             false,
         );
 
@@ -913,6 +940,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             ShowReceipt::Never,
+            None,
             None,
             false,
         );
@@ -955,6 +983,7 @@ mod tests {
             HEIGHT,
             show_receipt,
             None,
+            None,
             false,
         );
 
@@ -987,6 +1016,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             show_receipt,
+            None,
             None,
             false,
         );
@@ -1021,6 +1051,7 @@ mod tests {
             HEIGHT,
             show_receipt,
             None,
+            None,
             false,
         );
 
@@ -1053,6 +1084,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             show_receipt,
+            None,
             None,
             false,
         );
@@ -1088,6 +1120,7 @@ mod tests {
             WIDTH,
             HEIGHT,
             show_receipt,
+            None,
             None,
             false,
         );
@@ -1136,6 +1169,7 @@ mod tests {
             HEIGHT,
             show_receipt,
             None,
+            None,
             false,
         );
 
@@ -1148,9 +1182,86 @@ mod tests {
                 ),
                 Span::styled("boxdot", Style::default().fg(Color::Green)),
                 Span::raw(": "),
-                Span::raw("Mention @boxdot  and even more @boxdot ."),
+                Span::raw("Mention @boxdot  and even more"),
             ]),
-            Line::from(vec![Span::raw("                  End")]),
+            Line::from(vec![Span::raw("                  @boxdot . End")]),
+        ]));
+        assert_eq!(rendered, Some(expected));
+    }
+
+    #[test]
+    fn test_display_long_message_wraps() {
+        let names = name_resolver();
+        let msg = Message {
+            message: Some(
+                "This is a very long message that should wrap across multiple lines in the display"
+                    .into(),
+            ),
+            ..test_message()
+        };
+        let rendered = display_message(
+            &names,
+            &msg,
+            PREFIX,
+            WIDTH,
+            HEIGHT,
+            ShowReceipt::Never,
+            None,
+            None,
+            false,
+        );
+
+        let expected = ListItem::new(Text::from(vec![
+            Line::from(vec![
+                Span::styled("", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    display_time(msg.arrived_at),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("boxdot", Style::default().fg(Color::Green)),
+                Span::raw(": "),
+                Span::raw("This is a very long message that"),
+            ]),
+            Line::from(vec![Span::raw(
+                "                  should wrap across multiple lines in the",
+            )]),
+            Line::from(vec![Span::raw("                  display")]),
+        ]));
+        assert_eq!(rendered, Some(expected));
+    }
+
+    #[test]
+    fn test_display_unread_messages_division() {
+        let names = name_resolver();
+        let msg = Message {
+            message: Some("Hello, World!".into()),
+            ..test_message()
+        };
+        let division = "--new messages--".to_owned();
+        let rendered = display_message(
+            &names,
+            &msg,
+            PREFIX,
+            WIDTH,
+            HEIGHT,
+            ShowReceipt::Never,
+            None,
+            Some(division.clone()),
+            false,
+        );
+
+        let expected = ListItem::new(Text::from(vec![
+            Line::from(division),
+            Line::from(vec![
+                Span::styled("", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    display_time(msg.arrived_at),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled("boxdot", Style::default().fg(Color::Green)),
+                Span::raw(": "),
+                Span::raw("Hello, World!"),
+            ]),
         ]));
         assert_eq!(rendered, Some(expected));
     }
