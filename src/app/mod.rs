@@ -37,7 +37,9 @@ pub struct App {
     pub help_scroll: (u16, u16),
     pub user_id: Uuid,
     pub should_quit: bool,
+    pub open_editor_requested: bool,
     display_help: bool,
+    show_channel_list: bool,
     receipt_handler: ReceiptHandler,
     pub input: Input,
     pub is_multiline_input: bool,
@@ -98,7 +100,9 @@ impl App {
             messages,
             help_scroll: (0, 0),
             should_quit: false,
+            open_editor_requested: false,
             display_help: false,
+            show_channel_list: true,
             receipt_handler: ReceiptHandler::new(),
             input: Default::default(),
             is_multiline_input: false,
@@ -251,6 +255,14 @@ impl App {
 
     pub fn is_select_channel_shown(&self) -> bool {
         self.select_channel.is_shown
+    }
+
+    pub fn is_channel_list_shown(&self) -> bool {
+        self.show_channel_list
+    }
+
+    pub fn toggle_channel_list(&mut self) {
+        self.show_channel_list = !self.show_channel_list;
     }
 
     pub fn handle_event(&mut self, event: Event) -> anyhow::Result<()> {

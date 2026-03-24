@@ -2,6 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.9.1] - 2026-03-15
+
+### 🚀 Features
+
+- Channel list toggle (#490)
+- Add editor mode with configurable ctrl-o keybind (#488)
+
+### 🐛 Bug Fixes
+
+- Fix device linking (#510)
+- Fix path traversal in attachment name (#505)
+- Parse binary fields in messages (#504)
+- Replace `Color::Gray` with `Color::Reset` in name resolver (#492)
+
+
+* @Koleok made their first contribution in #488
+* @John-Toohey made their first contribution in #492
+
+## [0.9.0] - 2026-03-03
+
+This is a major release due to fundamental changes in the underlying Signal
+libraries.
+
+### 🚀 Features
+
+- Add Nix flake for reproducible builds (#474)
+- Remove user name alignment at the longest user name (#480)
+- Allow to mute channels locally (#484)
+- Add and implement delete button mapping (#485)
+
+### 🐛 Bug Fixes
+
+- Correct message selection with date separators (#468)
+- Missing author after date separator (#479)
+- Cut off lines (#481)
+- Pass absolute path to xdg-open consistently (#482)
+- Support old notification config format (#483)
+- App stopped working (#495)
+
+### 🚜 Refactor
+
+- Split app into modules (#475)
+
+### ⚙️ Miscellaneous Tasks
+
+- Upgrade dependencies (#466)
+- Fix typos (#477)
+
+
+* @chrstnwhlrt made their first contribution in #474
+
 ## [0.8.1] - 2026-01-15
 
 ### 🐛 Bug Fixes

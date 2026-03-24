@@ -15,6 +15,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use gurk::signal::LocalPool;
 use gurk::{app::App, config::Config};
 use gurk::{backoff::Backoff, passphrase::Passphrase};
 use gurk::{
@@ -26,9 +27,7 @@ use presage::libsignal_service::content::Content;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tokio::{runtime, select};
 use tokio_stream::StreamExt;
-use tokio_util::task::LocalPoolHandle;
-use tracing::debug;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use url::Url;
 
 const TARGET_FPS: u64 = 144;
@@ -90,6 +89,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let runtime = runtime::Builder::new_multi_thread()
+        .thread_stack_size(8 * 1024 * 1024)
         .worker_threads(2)
         .enable_all()
         .build()?;
@@ -118,7 +118,7 @@ pub enum Event {
 }
 
 async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Result<()> {
-    let local_pool = LocalPoolHandle::new(2);
+    let local_pool = LocalPool::new();
 
     let mut signal_manager =
         signal::ensure_linked_device(relink, local_pool.clone(), &config, &passphrase).await?;
@@ -147,27 +147,33 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
     app.populate_names_cache().await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(100);
-    tokio::spawn({
+    // Stored reader so it can be aborted before launching an external editor
+    // (otherwise both processes compete for stdin and the editor ends up missing keystrokes).
+    let spawn_event_reader = {
         let tx = tx.clone();
-        async move {
-            let mut reader = EventStream::new().fuse();
-            while let Some(event) = reader.next().await {
-                match event {
-                    Ok(CEvent::Key(key)) => tx.send(Event::Input(key)).await.unwrap(),
-                    Ok(CEvent::Resize(cols, rows)) => {
-                        tx.send(Event::Resize { cols, rows }).await.unwrap()
+        move || {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut reader = EventStream::new().fuse();
+                while let Some(event) = reader.next().await {
+                    match event {
+                        Ok(CEvent::Key(key)) => tx.send(Event::Input(key)).await.unwrap(),
+                        Ok(CEvent::Resize(cols, rows)) => {
+                            tx.send(Event::Resize { cols, rows }).await.unwrap()
+                        }
+                        Ok(CEvent::Mouse(button)) => tx.send(Event::Click(button)).await.unwrap(),
+                        Ok(CEvent::Paste(content)) => tx.send(Event::Paste(content)).await.unwrap(),
+                        _ => (),
                     }
-                    Ok(CEvent::Mouse(button)) => tx.send(Event::Click(button)).await.unwrap(),
-                    Ok(CEvent::Paste(content)) => tx.send(Event::Paste(content)).await.unwrap(),
-                    _ => (),
                 }
-            }
+            })
         }
-    });
+    };
+    let mut event_reader_handle = spawn_event_reader();
 
     let inner_tx = tx.clone();
 
-    local_pool.spawn_pinned(|| async move {
+    local_pool.spawn(move || async move {
         let mut backoff = Backoff::new();
         loop {
             let mut messages = if !is_online().await {
@@ -231,10 +237,9 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
         let mut interval = tokio::time::interval(RECEIPT_BUDGET);
         loop {
             interval.tick().await;
-            tick_tx
-                .send(Event::Tick)
-                .await
-                .expect("Cannot tick: events channel closed.");
+            if tick_tx.send(Event::Tick).await.is_err() {
+                break;
+            }
         }
     });
 
@@ -344,6 +349,43 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
             }
             None => {
                 break;
+            }
+        }
+
+        if app.open_editor_requested {
+            app.open_editor_requested = false;
+            let initial_content = app.input.data.clone();
+
+            // Abort event reader BEFORE releasing the terminal so editor gets
+            // exclusive access to stdin (no stolen keystrokes).
+            event_reader_handle.abort();
+            let _ = event_reader_handle.await;
+
+            execute!(
+                terminal.backend_mut(),
+                LeaveAlternateScreen,
+                DisableMouseCapture
+            )?;
+            terminal.show_cursor()?;
+            disable_raw_mode()?;
+
+            // editor on blocking thread (edit::edit spawns subprocess + waits)
+            let edit_result =
+                tokio::task::spawn_blocking(move || edit::edit(initial_content)).await?;
+
+            enable_raw_mode()?;
+            execute!(
+                terminal.backend_mut(),
+                EnterAlternateScreen,
+                EnableMouseCapture
+            )?;
+            terminal.clear()?;
+
+            event_reader_handle = spawn_event_reader();
+            if let Ok(text) = edit_result {
+                let text = text.trim_end_matches('\n').to_string();
+                app.input.data = text;
+                app.input.on_end();
             }
         }
 

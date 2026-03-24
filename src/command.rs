@@ -227,7 +227,11 @@ pub enum Command {
     OpenFile,
     #[strum(props(desc = "Toggle mute for the selected channel"))]
     ToggleMuteChannel,
+    #[strum(props(desc = "Toggle channel list pane visibility"))]
+    ToggleChannelList,
     // ReplyMessage,
+    #[strum(props(desc = "Open external editor to compose a message"))]
+    OpenEditor,
     // DeleteMessage,
 }
 
@@ -490,6 +494,8 @@ backspace = "delete_character previous"
 delete = "delete_character next"
 tab = "react"
 alt-m = "toggle_mute_channel"
+alt-l = "toggle_channel_list"
+ctrl-o = "open_editor"
 
 [message_selected]
 alt-y = "copy_message selected"

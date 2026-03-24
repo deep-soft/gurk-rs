@@ -45,19 +45,31 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_help(f, app, chunks[1]);
         return;
     }
-    let chunks = Layout::default()
-        .constraints(
-            [
-                Constraint::Ratio(1, CHANNEL_VIEW_RATIO),
-                Constraint::Ratio(3, CHANNEL_VIEW_RATIO),
-            ]
-            .as_ref(),
-        )
-        .direction(Direction::Horizontal)
-        .split(f.area());
 
-    draw_channels(f, app, chunks[0]);
-    draw_chat(f, app, chunks[1]);
+    let chunks = if app.is_channel_list_shown() {
+        Layout::default()
+            .constraints(
+                [
+                    Constraint::Ratio(1, CHANNEL_VIEW_RATIO),
+                    Constraint::Ratio(3, CHANNEL_VIEW_RATIO),
+                ]
+                .as_ref(),
+            )
+            .direction(Direction::Horizontal)
+            .split(f.area())
+    } else {
+        Layout::default()
+            .constraints([Constraint::Percentage(100)].as_ref())
+            .direction(Direction::Horizontal)
+            .split(f.area())
+    };
+
+    if app.is_channel_list_shown() {
+        draw_channels(f, app, chunks[0]);
+        draw_chat(f, app, chunks[1]);
+    } else {
+        draw_chat(f, app, chunks[0]);
+    }
 
     if app.select_channel.is_shown {
         draw_select_channel_popup(f, &mut app.select_channel);
@@ -94,7 +106,7 @@ fn draw_select_channel_popup(f: &mut Frame, select_channel: &mut SelectChannel) 
     }
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Gray));
+        .highlight_style(Style::default().reversed());
     f.render_stateful_widget(list, chunks[1], &mut select_channel.state);
 }
 
@@ -131,7 +143,7 @@ fn draw_channels(f: &mut Frame, app: &mut App, area: Rect) {
 
     let channels = List::new(channels)
         .block(Block::default().borders(Borders::ALL).title("Channels"))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Gray));
+        .highlight_style(Style::default().reversed());
     let no_channels = channels.is_empty();
     f.render_stateful_widget(channels, area, &mut app.channels.state);
 
@@ -412,15 +424,18 @@ fn draw_messages(f: &mut Frame, app: &mut App, area: Rect) {
     let offset = offset + first_idx;
     items = items.split_off(first_idx);
 
-    let title: String = if let Some(writing_people) = writing_people {
-        format!("Messages {writing_people}")
-    } else {
-        "Messages".to_string()
+    let title = {
+        let channel_name = app.channel_name(&channel);
+        if let Some(writing_people) = writing_people {
+            format!("{channel_name} - Messages {writing_people}")
+        } else {
+            format!("{channel_name} - Messages")
+        }
     };
 
     let list = List::new(items)
         .block(Block::default().title(title).borders(Borders::ALL))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Gray))
+        .highlight_style(Style::default().reversed())
         .direction(ListDirection::BottomToTop);
 
     // re-borrow channel messages mutably
