@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::time::Instant;
 
 use anyhow::{Context as _, anyhow};
 use itertools::Itertools;
@@ -10,11 +10,11 @@ use presage::proto::sync_message::{Read, Sent};
 use presage::proto::{
     AttachmentPointer, DataMessage, EditMessage, ReceiptMessage, SyncMessage, TypingMessage,
 };
-use presage::proto::{GroupContextV2, data_message::Reaction};
+use presage::proto::{GroupContextV2, data_message::Delete, data_message::Reaction};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::data::{BodyRange, ChannelId, Message, TypingAction, TypingSet};
+use crate::data::{BodyRange, ChannelId, Message, TypingAction, TypingSet, parse_uuid};
 use crate::receipt::{Receipt, ReceiptEvent};
 use crate::signal::{Attachment, GroupIdentifierBytes};
 use crate::storage::MessageId;
@@ -24,6 +24,37 @@ use super::{
 };
 
 impl App {
+    /// Stores the `message` in the storage and updates the message window if the channel matches.
+    pub(crate) fn store_message(&mut self, channel_id: ChannelId, message: Message) {
+        self.storage.store_message(channel_id, &message);
+        if let Some(window) = self.window.as_mut()
+            && window.channel_id() == channel_id
+        {
+            window.upsert(message);
+        }
+    }
+
+    /// Applies an edit to a stored message and updates the message window with the edited
+    /// original.
+    ///
+    /// Returns `None` if the message pointed to by `target_sent_timestamp` does not exist.
+    pub(crate) fn store_edited_message(
+        &mut self,
+        channel_id: ChannelId,
+        target_sent_timestamp: u64,
+        message: Message,
+    ) -> Option<()> {
+        let message =
+            self.storage
+                .store_edited_message(channel_id, target_sent_timestamp, message)?;
+        if let Some(window) = self.window.as_mut()
+            && window.channel_id() == channel_id
+        {
+            window.upsert(message);
+        }
+        Some(())
+    }
+
     pub async fn on_message(&mut self, content: Box<Content>) -> anyhow::Result<()> {
         // tracing::info!(?content, "incoming");
 
@@ -40,7 +71,68 @@ impl App {
             self.handle_read(read);
         }
 
-        let (channel_idx, message) = match (content.metadata, content.body) {
+        let (channel_id, message) = match (content.metadata, content.body) {
+            // Sync delete: we deleted a message from another device (any channel type)
+            (
+                _,
+                ContentBody::SynchronizeMessage(
+                    sync_message @ SyncMessage {
+                        sent:
+                            Some(Sent {
+                                message:
+                                    Some(DataMessage {
+                                        delete:
+                                            Some(Delete {
+                                                target_sent_timestamp: Some(target_sent_timestamp),
+                                            }),
+                                        ..
+                                    }),
+                                ..
+                            }),
+                        ..
+                    },
+                ),
+            ) => {
+                if let Some(channel_id) = sync_message.channel_id() {
+                    let message_id = MessageId::new(channel_id, target_sent_timestamp);
+                    self.storage.delete_message(message_id);
+                    info!(target_sent_timestamp, "message deleted via sync");
+                } else {
+                    warn!(
+                        target_sent_timestamp,
+                        "received sync delete for unknown channel"
+                    );
+                }
+                return Ok(());
+            }
+            // Delete for me: message removed from our own devices only
+            (
+                _,
+                ContentBody::SynchronizeMessage(SyncMessage {
+                    delete_for_me: Some(delete_for_me),
+                    ..
+                }),
+            ) => {
+                for msg_delete in &delete_for_me.message_deletes {
+                    let channel_id = msg_delete
+                        .conversation
+                        .as_ref()
+                        .and_then(conversation_to_channel_id);
+                    let Some(channel_id) = channel_id else {
+                        debug!("skipping delete-for-me with unresolvable conversation");
+                        continue;
+                    };
+                    for msg in &msg_delete.messages {
+                        if let Some(ts) = msg.sent_timestamp {
+                            let message_id = MessageId::new(channel_id, ts);
+                            self.storage.remove_message(message_id);
+                            self.remove_message_from_view(channel_id, ts);
+                            info!(sent_timestamp = ts, "message removed via delete-for-me");
+                        }
+                    }
+                }
+                return Ok(());
+            }
             // Private note message
             (
                 _,
@@ -57,6 +149,7 @@ impl App {
                                     sticker,
                                     body_ranges,
                                     reaction: None,
+                                    expire_timer,
                                     ..
                                 }),
                             ..
@@ -64,14 +157,19 @@ impl App {
                     ..
                 }),
             ) if parse_uuid(dest_str.as_deref(), dest_binary.as_deref()) == Some(user_id) => {
-                let channel_idx = self.ensure_own_channel_exists();
+                let channel_id = self.ensure_own_channel_exists();
+                self.update_channel_expire_timer(channel_id, expire_timer);
+
                 let attachments = self.save_attachments(attachment_pointers).await;
                 add_emoji_from_sticker(&mut body, sticker);
 
                 let body_ranges = body_ranges.into_iter().filter_map(BodyRange::from_proto);
 
-                let message = Message::new(user_id, body, body_ranges, timestamp, attachments);
-                (channel_idx, message)
+                let message = Message {
+                    expire_timer,
+                    ..Message::new(user_id, body, body_ranges, timestamp, attachments)
+                };
+                (channel_id, message)
             }
             // reactions
             (
@@ -217,6 +315,7 @@ impl App {
                                     sticker,
                                     body_ranges,
                                     reaction: None,
+                                    expire_timer,
                                     ..
                                 }),
                             ..
@@ -224,7 +323,7 @@ impl App {
                     ..
                 }),
             ) if sender.raw_uuid() == user_id => {
-                let channel_idx = if let Some(GroupContextV2 {
+                let channel_id = if let Some(GroupContextV2 {
                     master_key: Some(master_key),
                     revision: Some(revision),
                     ..
@@ -255,12 +354,17 @@ impl App {
                 };
 
                 add_emoji_from_sticker(&mut body, sticker);
+
+                // Update channel's expire timer if it changed
+                self.update_channel_expire_timer(channel_id, expire_timer);
+
                 let quote = quote.and_then(Message::from_quote).map(Box::new);
                 let attachments = self.save_attachments(attachment_pointers).await;
                 let body_ranges = body_ranges.into_iter().filter_map(BodyRange::from_proto);
 
                 let message = Message {
                     quote,
+                    expire_timer,
                     ..Message::new(user_id, body, body_ranges, timestamp, attachments)
                 };
 
@@ -269,7 +373,48 @@ impl App {
                     return Ok(());
                 }
 
-                (channel_idx, message)
+                (channel_id, message)
+            }
+            // Incoming remote delete (delete for everyone)
+            (
+                Metadata { sender, .. },
+                ContentBody::DataMessage(DataMessage {
+                    delete:
+                        Some(Delete {
+                            target_sent_timestamp: Some(target_sent_timestamp),
+                        }),
+                    group_v2,
+                    ..
+                }),
+            ) => {
+                let channel_id = if let Some(GroupContextV2 {
+                    master_key: Some(master_key),
+                    revision: Some(revision),
+                    ..
+                }) = group_v2
+                {
+                    let master_key = master_key
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid group master key"))?;
+                    self.ensure_group_channel_exists(master_key, revision)
+                        .await
+                        .context("failed to create group channel")?
+                } else {
+                    let name = self.name_by_id(sender.raw_uuid()).await;
+                    self.ensure_contact_channel_exists(sender.raw_uuid(), &name)
+                        .await
+                };
+
+                let message_id = MessageId::new(channel_id, target_sent_timestamp);
+                if self.storage.delete_message(message_id) {
+                    info!(target_sent_timestamp, "message deleted remotely");
+                } else {
+                    warn!(
+                        target_sent_timestamp,
+                        "received remote delete for unknown message"
+                    );
+                }
+                return Ok(());
             }
             // Incoming direct/group message
             (
@@ -283,10 +428,11 @@ impl App {
                     attachments: attachment_pointers,
                     sticker,
                     body_ranges,
+                    expire_timer,
                     ..
                 }),
             ) => {
-                let (channel_idx, from, channel_muted) = if let Some(GroupContextV2 {
+                let (channel_id, from, channel_muted) = if let Some(GroupContextV2 {
                     master_key: Some(master_key),
                     revision: Some(revision),
                     ..
@@ -305,7 +451,7 @@ impl App {
                     let master_key = master_key
                         .try_into()
                         .map_err(|_| anyhow!("invalid group master key"))?;
-                    let channel_idx = self
+                    let channel_id = self
                         .ensure_group_channel_exists(master_key, revision)
                         .await
                         .context("failed to create group channel")?;
@@ -313,12 +459,8 @@ impl App {
                     self.ensure_user_is_known(sender.raw_uuid(), profile_key)
                         .await;
                     let from = self.name_by_id(sender.raw_uuid()).await;
-                    let channel_id = self.channels.items[channel_idx];
-                    let channel = self
-                        .storage
-                        .channel(channel_id)
-                        .expect("non-existent channel");
-                    (channel_idx, from, channel.muted)
+                    let channel = self.channel(channel_id).expect("non-existent channel");
+                    (channel_id, from, channel.muted)
                 } else {
                     // incoming direct message
                     let profile_key = profile_key
@@ -328,25 +470,25 @@ impl App {
                     self.ensure_user_is_known(sender.raw_uuid(), Some(profile_key))
                         .await;
                     let name = self.name_by_id(sender.raw_uuid()).await;
-                    let channel_idx = self
+                    let channel_id = self
                         .ensure_contact_channel_exists(sender.raw_uuid(), &name)
                         .await;
                     // Reset typing notification as the Tipyng::Stop are not always sent by the server when a message is sent.
-                    let channel_id = self.channels.items[channel_idx];
-                    let mut channel = self
-                        .storage
-                        .channel(channel_id)
-                        .expect("non-existent channel")
-                        .into_owned();
-                    let from = channel.name.clone();
-                    let channel_muted = channel.muted;
-                    if channel.reset_writing(sender.raw_uuid()) {
-                        self.storage.store_channel(channel);
-                    }
-                    (channel_idx, from, channel_muted)
+                    let (from, channel_muted) = {
+                        let channel = self.channel(channel_id).expect("non-existent channel");
+                        (channel.name.clone(), channel.muted)
+                    };
+                    self.channels
+                        .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
+                            channel.reset_writing(sender.raw_uuid())
+                        });
+                    (channel_id, from, channel_muted)
                 };
 
                 add_emoji_from_sticker(&mut body, sticker);
+
+                // Update channel's expire timer if it changed
+                self.update_channel_expire_timer(channel_id, expire_timer);
 
                 let attachments = self.save_attachments(attachment_pointers).await;
                 if !channel_muted {
@@ -364,6 +506,7 @@ impl App {
                 let body_ranges = body_ranges.into_iter().filter_map(BodyRange::from_proto);
                 let message = Message {
                     quote,
+                    expire_timer,
                     ..Message::new(sender.raw_uuid(), body, body_ranges, timestamp, attachments)
                 };
 
@@ -371,7 +514,7 @@ impl App {
                     return Ok(());
                 }
 
-                (channel_idx, message)
+                (channel_id, message)
             }
             (metadata, ContentBody::SynchronizeMessage(sync_message)) => {
                 return self.handle_sync_message(metadata, sync_message);
@@ -417,13 +560,79 @@ impl App {
                 return Ok(());
             }
 
+            // Incoming edit from another user
+            (
+                Metadata { sender, .. },
+                ContentBody::EditMessage(EditMessage {
+                    target_sent_timestamp: Some(target_sent_timestamp),
+                    data_message:
+                        Some(DataMessage {
+                            mut body,
+                            group_v2,
+                            timestamp: Some(timestamp),
+                            profile_key,
+                            body_ranges,
+                            sticker,
+                            ..
+                        }),
+                }),
+            ) => {
+                let channel_id = if let Some(GroupContextV2 {
+                    master_key: Some(master_key),
+                    revision: Some(revision),
+                    ..
+                }) = group_v2
+                {
+                    let profile_key = match profile_key {
+                        Some(pk) => {
+                            Some(pk.try_into().map_err(|_| anyhow!("invalid profile key"))?)
+                        }
+                        None => None,
+                    };
+                    let master_key = master_key
+                        .try_into()
+                        .map_err(|_| anyhow!("invalid group master key"))?;
+                    let channel_id = self
+                        .ensure_group_channel_exists(master_key, revision)
+                        .await
+                        .context("failed to create group channel")?;
+                    self.ensure_user_is_known(sender.raw_uuid(), profile_key)
+                        .await;
+                    channel_id
+                } else {
+                    let profile_key = profile_key.and_then(|pk| pk.try_into().ok());
+                    self.ensure_user_is_known(sender.raw_uuid(), profile_key)
+                        .await;
+                    let name = self.name_by_id(sender.raw_uuid()).await;
+                    self.ensure_contact_channel_exists(sender.raw_uuid(), &name)
+                        .await
+                };
+
+                add_emoji_from_sticker(&mut body, sticker);
+                let body_ranges = body_ranges.into_iter().filter_map(BodyRange::from_proto);
+                let message = Message::new(sender.raw_uuid(), body, body_ranges, timestamp, vec![]);
+
+                if self
+                    .store_edited_message(channel_id, target_sent_timestamp, message)
+                    .is_some()
+                {
+                    self.touch_channel(channel_id, sender.raw_uuid() == self.user_id);
+                } else {
+                    warn!(
+                        target_sent_timestamp,
+                        "could not find original message to apply edit"
+                    );
+                }
+                return Ok(());
+            }
+
             unhandled => {
                 info!(?unhandled, "skipping unhandled message");
                 return Ok(());
             }
         };
 
-        self.add_message_to_channel(channel_idx, message);
+        self.add_message_to_channel(channel_id, message);
 
         Ok(())
     }
@@ -440,8 +649,38 @@ impl App {
         self.bell();
     }
 
+    fn update_channel_expire_timer(&mut self, channel_id: ChannelId, expire_timer: Option<u32>) {
+        let new_timer = expire_timer.filter(|&t| t > 0);
+        self.channels
+            .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
+                if channel.expire_timer != new_timer {
+                    channel.expire_timer = new_timer;
+                    true
+                } else {
+                    false
+                }
+            });
+    }
+
     pub fn step_receipts(&mut self) {
         self.receipt_handler.step(self.signal_manager.as_ref());
+    }
+
+    /// Expire typing indicators older than TYPING_TIMEOUT_SECS
+    pub fn expire_typing_indicators(&mut self) {
+        // Can't iterate through channels and update them at the same time
+        let writing: Vec<ChannelId> = self
+            .channels()
+            .iter()
+            .filter(|channel| channel.is_writing())
+            .map(|channel| channel.id)
+            .collect();
+        for channel_id in writing {
+            self.channels
+                .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
+                    channel.expire_typing()
+                });
+        }
     }
 
     fn handle_typing(
@@ -452,43 +691,47 @@ impl App {
         _timestamp: u64,
     ) -> Result<(), ()> {
         if let Some(gid) = group_id {
-            let mut channel = self
-                .storage
-                .channel(ChannelId::Group(gid))
-                .ok_or(())?
-                .into_owned();
-            if let TypingSet::GroupTyping(ref mut hash_set) = channel.typing {
-                match action {
-                    TypingAction::Started => {
-                        hash_set.insert(sender_uuid);
+            self.channels.modify_channel_by_id(
+                &mut *self.storage,
+                ChannelId::Group(gid),
+                |channel| {
+                    if let TypingSet::GroupTyping(ref mut map) = channel.typing {
+                        match action {
+                            TypingAction::Started => {
+                                map.insert(sender_uuid, Instant::now());
+                            }
+                            TypingAction::Stopped => {
+                                map.remove(&sender_uuid);
+                            }
+                        }
+                        true
+                    } else {
+                        error!("Got a single typing instead of hash set on a group");
+                        false
                     }
-                    TypingAction::Stopped => {
-                        hash_set.remove(&sender_uuid);
-                    }
-                }
-                self.storage.store_channel(channel);
-            } else {
-                error!("Got a single typing instead of hash set on a group");
-            }
+                },
+            );
         } else {
-            let mut channel = self
-                .storage
-                .channel(ChannelId::User(sender_uuid))
-                .ok_or(())?
-                .into_owned();
-            if let TypingSet::SingleTyping(_) = channel.typing {
-                match action {
-                    TypingAction::Started => {
-                        channel.typing = TypingSet::SingleTyping(true);
+            self.channels.modify_channel_by_id(
+                &mut *self.storage,
+                ChannelId::User(sender_uuid),
+                |channel| {
+                    if let TypingSet::SingleTyping(_) = channel.typing {
+                        match action {
+                            TypingAction::Started => {
+                                channel.typing = TypingSet::SingleTyping(Some(Instant::now()));
+                            }
+                            TypingAction::Stopped => {
+                                channel.typing = TypingSet::SingleTyping(None);
+                            }
+                        }
+                        true
+                    } else {
+                        error!("Got a hash set instead of single typing on a direct chat");
+                        false
                     }
-                    TypingAction::Stopped => {
-                        channel.typing = TypingSet::SingleTyping(false);
-                    }
-                }
-                self.storage.store_channel(channel);
-            } else {
-                error!("Got a hash set instead of single typing on a direct chat");
-            }
+                },
+            );
         }
         Ok(())
     }
@@ -499,8 +742,8 @@ impl App {
 
     fn handle_receipt(&mut self, sender_uuid: Uuid, receipt: Receipt, mut timestamps: Vec<u64>) {
         let sender_channels: Vec<ChannelId> = self
-            .storage
             .channels()
+            .iter()
             .filter(|channel| match channel.id {
                 ChannelId::User(uuid) => uuid == sender_uuid,
                 ChannelId::Group(_) => channel
@@ -530,7 +773,7 @@ impl App {
                     .take_while(|msg| msg.arrived_at >= ts)
                     .find(|msg| msg.arrived_at == ts)
                 {
-                    let mut msg = msg.into_owned();
+                    let mut msg = msg;
                     if msg.receipt < receipt {
                         msg.receipt = msg.receipt.max(receipt);
                         messages_to_store.push(msg);
@@ -547,7 +790,7 @@ impl App {
 
         if let Some(channel_id) = found_channel_id {
             for message in messages_to_store {
-                self.storage.store_message(channel_id, message);
+                self.store_message(channel_id, message);
             }
         }
     }
@@ -566,8 +809,7 @@ impl App {
     ) -> Option<()> {
         let mut message = self
             .storage
-            .message(MessageId::new(channel_id, target_sent_timestamp))?
-            .into_owned();
+            .message(MessageId::new(channel_id, target_sent_timestamp))?;
         let from_current_user = self.user_id == message.from_id;
 
         let reaction_idx = message
@@ -586,12 +828,13 @@ impl App {
             message.reactions.push((sender_uuid, emoji.clone()));
             true
         };
-        let message = self.storage.store_message(channel_id, message);
+        let message_text = message.message.clone();
+        self.store_message(channel_id, message);
 
         if is_added && channel_id != ChannelId::User(self.user_id) {
             // Notification
             let mut notification = format!("reacted {emoji}");
-            if let Some(text) = message.message.as_ref() {
+            if let Some(text) = message_text.as_ref() {
                 notification.push_str(" to: ");
                 notification.push_str(text);
             }
@@ -615,13 +858,7 @@ impl App {
                 self.bell();
             }
 
-            let channel_idx = self
-                .channels
-                .items
-                .iter()
-                .position(|id| id == &channel_id)
-                .expect("non-existent channel");
-            self.touch_channel(channel_idx, from_current_user);
+            self.touch_channel(channel_id, from_current_user);
         }
 
         Some(())
@@ -698,53 +935,14 @@ impl App {
         }) = sync_message.sent
         {
             let from_id = metadata.sender.raw_uuid();
-            // Note: target_sent_timestamp points to the previous edit or the original message
-            let edited = self
-                .storage
-                .message(MessageId::new(channel_id, target_sent_timestamp))
-                .context("no message to edit")?;
-
-            // get original message
-            let mut original = if let Some(arrived_at) = edited.edit {
-                // previous edit => get original message
-                self.storage
-                    .message(MessageId::new(channel_id, arrived_at))
-                    .context("no original edited message")?
-                    .into_owned()
-            } else {
-                // original message => first edit
-                let original = edited.into_owned();
-
-                // preserve body of the original message; it is replaced below
-                let mut preserved = original.clone();
-                preserved.arrived_at = original.arrived_at + 1;
-                preserved.edit = Some(original.arrived_at);
-                self.storage.store_message(channel_id, preserved);
-
-                original
-            };
-
-            // store the incoming edit
-            self.storage.store_message(
+            self.store_edited_message(
                 channel_id,
-                Message {
-                    edit: Some(original.arrived_at),
-                    ..Message::text(from_id, arrived_at, body.clone())
-                },
-            );
+                target_sent_timestamp,
+                Message::text(from_id, arrived_at, body),
+            )
+            .context("no message to edit")?;
 
-            // override the body of the original message
-            original.message.replace(body);
-            original.edited = true;
-            self.storage.store_message(channel_id, original);
-
-            let channel_idx = self
-                .channels
-                .items
-                .iter()
-                .position(|id| id == &channel_id)
-                .context("editing message in non-existent channel")?;
-            self.touch_channel(channel_idx, from_id == self.user_id);
+            self.touch_channel(channel_id, from_id == self.user_id);
         }
 
         Ok(())
@@ -752,31 +950,40 @@ impl App {
 
     /// Handles read notifications
     pub(crate) fn handle_read(&mut self, read: &[Read]) {
-        // First collect all the read counters to avoid hitting the storage for the same channel
-        let read_counters: BTreeMap<ChannelId, u32> = read
-            .iter()
-            .filter_map(|read| {
-                let arrived_at = read.timestamp?;
-                let channel_id = self.storage.message_channel(arrived_at)?;
-                let num_unread = self
-                    .storage
-                    .messages(channel_id)
-                    .rev()
-                    .take_while(|msg| arrived_at < msg.arrived_at)
-                    .count();
-                let num_unread: u32 = num_unread.try_into().ok()?;
-                Some((channel_id, num_unread))
-            })
-            .collect();
-        // Update the unread counters
-        for (channel_id, num_unread) in read_counters {
-            if let Some(channel) = self.storage.channel(channel_id)
-                && channel.unread_messages > 0
-            {
-                let mut channel = channel.into_owned();
-                channel.unread_messages = num_unread;
-                self.storage.store_channel(channel);
+        if read.is_empty() {
+            return;
+        }
+
+        let mut read_at: Vec<_> = read.iter().filter_map(|read| read.timestamp).collect();
+        read_at.sort_unstable();
+
+        let mut updates = Vec::new();
+        for channel in self.channels() {
+            // skip channels without unread messages
+            if channel.unread_messages == 0 {
+                continue;
             }
+
+            // find the last read message in this channel
+            let Some(last_read_at) = read_at.iter().rev().copied().find(|&timestamp| {
+                self.storage
+                    .message(MessageId::new(channel.id, timestamp))
+                    .is_some()
+            }) else {
+                continue;
+            };
+
+            let num_unread = self.storage.messages_count_after(channel.id, last_read_at);
+            updates.push((channel.id, (num_unread as u32).min(channel.unread_messages)));
+        }
+
+        // Can't iterate though channels and update them at the same time
+        for (channel_id, unread_messages) in updates {
+            self.channels
+                .modify_channel_by_id(&mut *self.storage, channel_id, |channel| {
+                    channel.unread_messages = unread_messages;
+                    true
+                });
         }
     }
 }
@@ -810,14 +1017,6 @@ impl MessageExt for SyncMessage {
     }
 }
 
-/// First parse the binary field, then fallback to the string field
-fn parse_uuid(str_field: Option<&str>, binary_field: Option<&[u8]>) -> Option<Uuid> {
-    binary_field
-        .and_then(ServiceId::parse_from_service_id_binary)
-        .map(|sid| sid.raw_uuid())
-        .or_else(|| str_field.and_then(|s| s.parse().ok()))
-}
-
 trait SyncSentExt {
     fn parse_destination_uuid(&self) -> Option<Uuid>;
 }
@@ -831,40 +1030,124 @@ impl SyncSentExt for Sent {
     }
 }
 
+fn conversation_to_channel_id(conv: &presage::proto::ConversationIdentifier) -> Option<ChannelId> {
+    use presage::proto::conversation_identifier::Identifier;
+    match conv.identifier.as_ref()? {
+        Identifier::ThreadServiceId(s) => {
+            let uuid: Uuid = s.parse().ok()?;
+            Some(ChannelId::User(uuid))
+        }
+        Identifier::ThreadServiceIdBinary(b) => {
+            let sid = ServiceId::parse_from_service_id_binary(b)?;
+            Some(ChannelId::User(sid.raw_uuid()))
+        }
+        Identifier::ThreadGroupId(b) => {
+            let bytes: [u8; 32] = b.as_slice().try_into().ok()?;
+            Some(ChannelId::Group(bytes))
+        }
+        Identifier::ThreadE164(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::app::tests::test_app;
+    use crate::data::Channel;
 
     use super::*;
 
-    #[test]
-    #[ignore = "forgetful storage does not support lookup by arrived_at"]
-    fn test_handle_read() {
-        let (mut app, _events, _sent_messages) = test_app();
+    /// Overwrites the unread counter of the given channel in memory and storage.
+    fn set_unread(app: &mut App, channel_id: ChannelId, unread_messages: u32) {
+        app.channels
+            .modify_channel_by_id(&mut *app.storage, channel_id, |channel| {
+                channel.unread_messages = unread_messages;
+                true
+            });
+    }
 
-        let channel_id = *app.channels.items.first().unwrap();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_read() {
+        let (mut app, _events, _sent_messages) = test_app().await;
 
-        // new incoming message
-        let message = app
-            .storage
-            .store_message(
-                channel_id,
-                Message::text(app.user_id, 42, "unread message".to_string()),
-            )
-            .into_owned();
+        // fixture channel already has "First message" at arrived_at 0
+        let channel_id = app.channels().first().unwrap().id;
+        app.storage.store_message(
+            channel_id,
+            &Message::text(app.user_id, 42, "unread message".to_string()),
+        );
+        set_unread(&mut app, channel_id, 2);
 
-        // mark as unread
-        app.storage
-            .channel(channel_id)
-            .unwrap()
-            .into_owned()
-            .unread_messages = 1;
-
+        // reading the older message leaves the newer one unread
         app.handle_read(&[Read {
-            timestamp: Some(message.arrived_at),
+            timestamp: Some(0),
             ..Default::default()
         }]);
+        assert_eq!(app.channel(channel_id).unwrap().unread_messages, 1);
 
-        assert_eq!(app.storage.channel(channel_id).unwrap().unread_messages, 0);
+        // reading the newer message clears the counter
+        app.handle_read(&[Read {
+            timestamp: Some(42),
+            ..Default::default()
+        }]);
+        assert_eq!(app.channel(channel_id).unwrap().unread_messages, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_handle_read_only_affects_matching_channel() {
+        let (mut app, _events, _sent_messages) = test_app().await;
+
+        let channel_a = app.channels().first().unwrap().id;
+        app.storage
+            .store_message(channel_a, &Message::text(app.user_id, 100, "a".to_string()));
+        set_unread(&mut app, channel_a, 1);
+
+        let channel_b = ChannelId::User(Uuid::new_v4());
+        app.store_channel(Channel {
+            id: channel_b,
+            name: "other".to_string(),
+            group_data: None,
+            unread_messages: 1,
+            muted: false,
+            typing: TypingSet::new(false),
+            expire_timer: None,
+        });
+        app.storage
+            .store_message(channel_b, &Message::text(app.user_id, 200, "b".to_string()));
+
+        // a read receipt for channel A's message must not touch channel B
+        app.handle_read(&[Read {
+            timestamp: Some(100),
+            ..Default::default()
+        }]);
+        assert_eq!(app.channel(channel_a).unwrap().unread_messages, 0);
+        assert_eq!(app.channel(channel_b).unwrap().unread_messages, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_incoming_message_increments_unread_in_channel_list() {
+        let (mut app, _events, _sent_messages) = test_app().await;
+
+        // channel A is the selected one
+        let channel_a = app.channels().first().unwrap().id;
+        assert_eq!(app.selected_channel_id(), Some(channel_a));
+
+        // a second, unselected channel
+        let other = Uuid::new_v4();
+        let channel_b = ChannelId::User(other);
+        app.store_channel(Channel {
+            id: channel_b,
+            name: "other".to_string(),
+            group_data: None,
+            unread_messages: 0,
+            muted: false,
+            typing: TypingSet::new(false),
+            expire_timer: None,
+        });
+
+        app.add_message_to_channel(channel_b, Message::text(other, 1000, "hi".to_string()));
+        assert_eq!(app.channel(channel_b).unwrap().unread_messages, 1);
+
+        app.add_message_to_channel(channel_b, Message::text(other, 1001, "there".to_string()));
+        assert_eq!(app.channel(channel_b).unwrap().unread_messages, 2);
     }
 }

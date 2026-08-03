@@ -2,6 +2,91 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.1] - 2026-07-26
+
+This release fixes potential account linking issues.
+
+### 🐛 Bug Fixes
+
+- Fix potential segfault on exit  (#567)
+
+### 💼 Other
+
+- *(deps)* Upgrade presage to the latest rev on main (#564)
+- *(deps)* Upgrade dependencies (#565, #566)
+
+## [0.10.0] - 2026-07-19
+
+This release significantly improves startup time and memory usage: messages
+are no longer loaded into memory all at once at startup, but fetched in a
+window around the current selection directly from the database. As a result,
+the app starts fast regardless of the size of the message history.
+
+### 🚀 Features
+
+- Add XDG, env var, and CLI support for config/data paths (#523)
+- Replace text with emoji while typing (#549)
+- Support tab to autocomplete emoji (#558)
+
+### 🐛 Bug Fixes
+
+- Assure data dir exists (#547)
+- Don't clear unread messages when navigating channels (#534)
+- Expire typing indicators after 10 seconds (#538)
+- Date line being off by 1 message (#552)
+- Parse binary fields in Quote (#553)
+- App not starting with terminal error (#555)
+- Currently selected channel is not bubbled up (#561)
+
+### 🚜 Refactor
+
+- Change messages primary key to (channel_id, arrived_at) (#551)
+- Simplify the storage trait (#560)
+
+### ⚡ Performance
+
+- Speed up database decryption on debug builds (#548)
+- Introduce windowed message storage API (#554)
+
+
+* @MarkAtwood made their first contribution in #523
+* @Limero made their first contribution in #547
+* @khyperia made their first contribution in #552
+
+## [0.9.3] - 2026-04-27
+
+### 🐛 Bug Fixes
+
+- Remove stray previous() in select_next_channel (#533)
+
+## [0.9.2] - 2026-04-26
+
+### 🚀 Features
+
+- Message deletion support (delete for everyone + delete for me) (#519)
+- Show typing indicator in channel list (#520)
+- Add ctrl+l to force full screen redraw (#521)
+- Disappearing messages support (#522)
+- Separate draft input per channel (#524)
+
+### 🐛 Bug Fixes
+
+- Handle incoming edit messages from other users (#518)
+- The order of the options in the onboarding on macOS (#507)
+
+### 💼 Other
+
+- Out of date nix flake (#515)
+
+### ⚙️ Miscellaneous Tasks
+
+- Upgrade presage and libsignal 0.87.4 -> 0.91.0 (#529)
+
+
+* @KiaraGrouwstra made their first contribution in #524
+* @cwedgwood made their first contribution in #522
+* @valyntyler made their first contribution in #515
+
 ## [0.9.1] - 2026-03-15
 
 ### 🚀 Features

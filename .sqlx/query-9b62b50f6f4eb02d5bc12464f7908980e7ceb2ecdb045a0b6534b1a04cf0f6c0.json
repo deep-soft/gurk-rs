@@ -1,0 +1,98 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                        SELECT\n                            id AS \"id: _\",\n                            name,\n                            group_master_key,\n                            group_revision,\n                            group_members AS \"group_members: _\",\n                            muted AS \"muted: _\",\n                            expire_timer\n                        FROM channels\n                        WHERE id = ?\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id: _",
+        "ordinal": 0,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "name",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "name": "group_master_key",
+        "ordinal": 2,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "group_master_key"
+          }
+        }
+      },
+      {
+        "name": "group_revision",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "group_revision"
+          }
+        }
+      },
+      {
+        "name": "group_members: _",
+        "ordinal": 4,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "group_members"
+          }
+        }
+      },
+      {
+        "name": "muted: _",
+        "ordinal": 5,
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "muted"
+          }
+        }
+      },
+      {
+        "name": "expire_timer",
+        "ordinal": 6,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "channels",
+            "name": "expire_timer"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "9b62b50f6f4eb02d5bc12464f7908980e7ceb2ecdb045a0b6534b1a04cf0f6c0"
+}

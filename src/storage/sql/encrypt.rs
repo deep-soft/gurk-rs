@@ -2,7 +2,10 @@ use std::fs::File;
 use std::io::Read;
 
 use anyhow::Context;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::{
+    AssertSqlSafe,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous},
+};
 use sqlx::{ConnectOptions, Connection, SqliteConnection};
 use tempfile::tempdir;
 use tracing::info;
@@ -30,14 +33,14 @@ pub(super) async fn encrypt_db(
     let mut conn = SqliteConnection::connect_with(&opts).await?;
     let passphrase = passphrase.sqlite_string();
     let passphrase = passphrase.as_str();
-    sqlx::raw_sql(&format!(
+    sqlx::raw_sql(AssertSqlSafe(format!(
         "
            ATTACH DATABASE '{}' AS encrypted KEY '{passphrase}';
            SELECT sqlcipher_export('encrypted');
            DETACH DATABASE encrypted;
         ",
         dest.display(),
-    ))
+    )))
     .execute(&mut conn)
     .await
     .context("failed to encrypt db")?;
@@ -77,7 +80,7 @@ mod tests {
         let path = tempdir.path().join("data.sqlite");
         let url: Url = format!("sqlite://{}", path.display()).parse().unwrap();
 
-        let _ = SqliteStorage::open_unenrypted(&url).await.unwrap();
+        let _ = SqliteStorage::open_unencrypted(&url).await.unwrap();
         assert!(path.exists());
         assert_eq!(is_sqlite_encrypted_heuristics(&url), Some(false));
 

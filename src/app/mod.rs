@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::cell::Cell;
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -11,8 +10,6 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::channels::SelectChannel;
-use crate::command::{ModeKeybinding, get_keybindings};
 use crate::config::Config;
 use crate::data::{Channel, ChannelId, Message, TypingSet};
 use crate::event::Event;
@@ -21,27 +18,40 @@ use crate::receipt::ReceiptHandler;
 use crate::signal::{Attachment, SignalManager};
 use crate::storage::{MessageId, Storage};
 use crate::util::StatefulList;
+use crate::{
+    app::channel::ChannelPosition,
+    command::{ModeKeybinding, get_keybindings},
+};
+use crate::{app::window::MessageWindow, channels::SelectChannel};
 
 use presage::proto::data_message::Sticker;
 
 mod channel;
 mod input;
 mod message;
+mod window;
 
 pub struct App {
     pub config: Config,
     signal_manager: Box<dyn SignalManager>,
     pub storage: Box<dyn Storage>,
-    pub channels: StatefulList<ChannelId>,
-    pub messages: BTreeMap<ChannelId, StatefulList<u64 /* arrived at*/>>,
+    /// List of channels in memory
+    ///
+    /// Additionally used as in-memory cache. All writes to the storage must update the data in this
+    /// list.
+    pub channels: StatefulList<Channel>,
+    pub(crate) positions: BTreeMap<ChannelId, ChannelPosition>,
+    pub(crate) window: Option<MessageWindow>,
     pub help_scroll: (u16, u16),
     pub user_id: Uuid,
     pub should_quit: bool,
+    pub should_clear: bool,
     pub open_editor_requested: bool,
     display_help: bool,
     show_channel_list: bool,
     receipt_handler: ReceiptHandler,
     pub input: Input,
+    drafts: BTreeMap<ChannelId, Input>,
     pub is_multiline_input: bool,
     editing: Option<MessageId>,
     pub(crate) select_channel: SelectChannel,
@@ -50,6 +60,16 @@ pub struct App {
     // It is expensive to hit the signal manager contacts storage, so we cache it
     names_cache: Cell<Option<BTreeMap<Uuid, String>>>,
     pub mode_keybindings: ModeKeybinding,
+    /// When the current channel was selected (for dwell-based timer activation)
+    channel_selected_at: std::time::Instant,
+    /// Channel whose message timers have been activated (avoids repeated scanning)
+    timers_activated_for: Option<ChannelId>,
+    /// Points to the next message that will expire
+    next_expiring_at: Option<u64>,
+    /// The height of the message view in the renderer
+    ///
+    /// Written by the renderer, used to load enough messages to fill the view
+    pub(crate) message_view_height: usize,
 }
 
 impl App {
@@ -60,26 +80,11 @@ impl App {
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<Event>)> {
         let user_id = signal_manager.user_id();
 
-        // build index of channels and messages for using them as lists content
-        let mut channels: StatefulList<ChannelId> = Default::default();
-        let mut messages: BTreeMap<_, StatefulList<_>> = BTreeMap::new();
-        for channel in storage.channels() {
-            channels.items.push(channel.id);
-            let channel_messages = &mut messages.entry(channel.id).or_default().items;
-            for message in storage.messages(channel.id) {
-                channel_messages.push(message.arrived_at);
-            }
-        }
-        channels.items.sort_unstable_by_key(|channel_id| {
-            let last_message_arrived_at = storage
-                .messages(*channel_id)
-                .next_back()
-                .map(|msg| msg.arrived_at);
-            let channel_name = storage
-                .channel(*channel_id)
-                .map(|channel| channel.name.clone());
-            (Reverse(last_message_arrived_at), channel_name)
-        });
+        // build the list of channels
+        let mut channels = StatefulList {
+            items: storage.channels(),
+            ..Default::default()
+        };
         channels.next();
 
         let clipboard = arboard::Clipboard::new()
@@ -91,20 +96,25 @@ impl App {
         let mode_keybindings = get_keybindings(&config.keybindings, config.default_keybindings)
             .expect("keybinding configuration failed");
 
-        let app = Self {
+        let next_expiring_at = storage.next_expiring_at();
+
+        let mut app = Self {
             config,
             signal_manager,
             user_id,
             storage,
             channels,
-            messages,
+            positions: Default::default(),
+            window: None,
             help_scroll: (0, 0),
             should_quit: false,
+            should_clear: false,
             open_editor_requested: false,
             display_help: false,
             show_channel_list: true,
             receipt_handler: ReceiptHandler::new(),
             input: Default::default(),
+            drafts: BTreeMap::new(),
             is_multiline_input: false,
             editing: None,
             select_channel: Default::default(),
@@ -112,7 +122,14 @@ impl App {
             event_tx,
             names_cache: Default::default(),
             mode_keybindings,
+            channel_selected_at: std::time::Instant::now(),
+            timers_activated_for: None,
+            next_expiring_at,
+            message_view_height: 0,
         };
+
+        app.on_channel_changed();
+
         Ok((app, event_rx))
     }
 
@@ -120,8 +137,8 @@ impl App {
     pub async fn populate_names_cache(&self) {
         let mut names_cache = BTreeMap::new();
         for user_id in self
-            .storage
             .channels()
+            .iter()
             .filter_map(|channel| channel.id.user())
         {
             if let Some(name) = self.resolve_name(user_id).await {
@@ -141,17 +158,40 @@ impl App {
         }
     }
 
+    /// Save current input to the old channel's draft and load the new channel's draft.
+    pub fn swap_channel_draft(
+        &mut self,
+        old_channel: Option<ChannelId>,
+        new_channel: Option<ChannelId>,
+    ) {
+        if old_channel == new_channel {
+            return;
+        }
+        // Save current input as old channel's draft
+        if let Some(old_id) = old_channel {
+            let old_input = std::mem::take(&mut self.input);
+            if !old_input.is_empty() {
+                self.drafts.insert(old_id, old_input);
+            } else {
+                self.drafts.remove(&old_id);
+            }
+        }
+        // Restore new channel's draft
+        if let Some(new_id) = new_channel {
+            self.input = self.drafts.remove(&new_id).unwrap_or_default();
+        } else {
+            self.input = Input::default();
+        }
+    }
+
     pub fn writing_people(&self, channel: &Channel) -> Option<String> {
         if channel.is_writing() {
             let uuids: Box<dyn Iterator<Item = Uuid>> = match &channel.typing {
-                TypingSet::GroupTyping(uuids) => Box::new(uuids.iter().copied()),
-                TypingSet::SingleTyping(a) => {
-                    if *a {
-                        Box::new(std::iter::once(channel.user_id().unwrap()))
-                    } else {
-                        Box::new(std::iter::empty())
-                    }
+                TypingSet::GroupTyping(map) => Box::new(map.keys().copied()),
+                TypingSet::SingleTyping(Some(_)) => {
+                    Box::new(std::iter::once(channel.user_id().unwrap()))
                 }
+                TypingSet::SingleTyping(None) => Box::new(std::iter::empty()),
             };
             Some(format!(
                 "[{}] writing...",
@@ -201,7 +241,7 @@ impl App {
             .filter(|name| !name.trim().is_empty())
         {
             debug!(%name, "resolved name from storage");
-            return Some(name.into_owned());
+            return Some(name);
         }
         None
     }
@@ -269,13 +309,9 @@ impl App {
         match event {
             Event::SentTextResult { message_id, result } => {
                 if let Err(error) = result {
-                    let mut message = self
-                        .storage
-                        .message(message_id)
-                        .context("no message")?
-                        .into_owned();
+                    let mut message = self.storage.message(message_id).context("no message")?;
                     message.send_failed = Some(error.to_string());
-                    self.storage.store_message(message_id.channel_id, message);
+                    self.store_message(message_id.channel_id, message);
                 }
             }
         }
@@ -371,23 +407,23 @@ pub(crate) mod tests {
 
     use arboard::ImageData;
 
-    use crate::config::User;
     use crate::data::GroupData;
     use crate::signal::GroupMasterKeyBytes;
     use crate::signal::test::SignalManagerMock;
-    use crate::storage::{ForgetfulStorage, MemCache};
+    use crate::{config::User, storage::SqliteStorage};
 
     use super::*;
 
-    pub(crate) fn test_app() -> (
+    pub(crate) async fn test_app() -> (
         App,
         mpsc::UnboundedReceiver<Event>,
         Rc<RefCell<Vec<Message>>>,
     ) {
+        let url = "sqlite::memory:".parse().unwrap();
+        let mut storage = SqliteStorage::open_unencrypted(&url).await.unwrap();
+
         let signal_manager = SignalManagerMock::new();
         let sent_messages = signal_manager.sent_messages.clone();
-
-        let mut storage = MemCache::new(ForgetfulStorage);
 
         let channel_id = ChannelId::User(Uuid::new_v4());
         let channel = Channel {
@@ -401,11 +437,12 @@ pub(crate) mod tests {
             unread_messages: 1,
             muted: false,
             typing: TypingSet::GroupTyping(Default::default()),
+            expire_timer: None,
         };
-        storage.store_channel(channel);
+        storage.store_channel(&channel);
         storage.store_message(
             channel_id,
-            Message {
+            &Message {
                 from_id: signal_manager.user_id(),
                 message: Some("First message".to_string()),
                 arrived_at: 0,
@@ -417,6 +454,9 @@ pub(crate) mod tests {
                 send_failed: Default::default(),
                 edit: Default::default(),
                 edited: Default::default(),
+                deleted: Default::default(),
+                expire_timer: None,
+                expires_at: None,
             },
         );
 
@@ -434,21 +474,21 @@ pub(crate) mod tests {
         (app, events, sent_messages)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_send_input() {
-        let (mut app, mut events, sent_messages) = test_app();
+        let (mut app, mut events, sent_messages) = test_app().await;
         let input = "Hello, World!";
         for c in input.chars() {
             app.get_input().put_char(c);
         }
-        app.send_input(0);
+        let channel_id = app.channels().first().unwrap().id;
+        app.send_input(channel_id);
 
         assert_eq!(sent_messages.borrow().len(), 1);
         let msg = sent_messages.borrow()[0].clone();
         assert_eq!(msg.message.as_ref().unwrap(), input);
 
-        let channel_id = app.channels.items[0];
-        let channel = app.storage.channel(channel_id).unwrap();
+        let channel = app.channel(channel_id).unwrap();
         assert_eq!(channel.unread_messages, 0);
 
         assert_eq!(app.get_input().data, "");
@@ -461,15 +501,16 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_send_input_with_emoji() {
-        let (mut app, mut events, sent_messages) = test_app();
+        let (mut app, mut events, sent_messages) = test_app().await;
         let input = "\u{1F47B}";
         for c in input.chars() {
             app.get_input().put_char(c);
         }
 
-        app.send_input(0);
+        let channel_id = app.channels().first().unwrap().id;
+        app.send_input(channel_id);
 
         assert_eq!(sent_messages.borrow().len(), 1);
         let msg = sent_messages.borrow()[0].clone();
@@ -485,15 +526,16 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_send_input_with_emoji_codepoint() {
-        let (mut app, mut events, sent_messages) = test_app();
+        let (mut app, mut events, sent_messages) = test_app().await;
         let input = ":thumbsup:";
         for c in input.chars() {
             app.get_input().put_char(c);
         }
 
-        app.send_input(0);
+        let channel_id = app.channels().first().unwrap().id;
+        app.send_input(channel_id);
 
         assert_eq!(sent_messages.borrow().len(), 1);
         let msg = sent_messages.borrow()[0].clone();
@@ -507,21 +549,20 @@ pub(crate) mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_add_reaction_with_emoji() {
-        let (mut app, _events, _sent_messages) = test_app();
+        let (mut app, _events, _sent_messages) = test_app().await;
 
-        let channel_id = app.channels.items[0];
-        app.messages
-            .get_mut(&channel_id)
-            .unwrap()
-            .state
-            .select(Some(0));
+        let channel_id = app.channels().first().unwrap().id;
+        app.positions.entry(channel_id).or_default().selected =
+            Some(app.storage.messages_tail(channel_id, 1)[0].arrived_at);
 
         app.get_input().put_char('\u{1F44D}');
-        app.add_reaction(0, None).await;
 
-        let arrived_at = app.messages[&channel_id].items[0];
+        let channel_id = app.channels().first().unwrap().id;
+        app.add_reaction(channel_id, None).await;
+
+        let arrived_at = app.storage.messages_tail(channel_id, 1)[0].arrived_at;
         let reactions = &app
             .storage
             .message(MessageId::new(channel_id, arrived_at))
@@ -531,23 +572,20 @@ pub(crate) mod tests {
         assert_eq!(reactions[0], (app.user_id, "\u{1F44D}".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_add_reaction_with_emoji_codepoint() {
-        let (mut app, _events, _sent_messages) = test_app();
+        let (mut app, _events, _sent_messages) = test_app().await;
 
-        let channel_id = app.channels.items[0];
-        app.messages
-            .get_mut(&channel_id)
-            .unwrap()
-            .state
-            .select(Some(0));
+        let channel_id = app.channels().first().unwrap().id;
+        app.positions.entry(channel_id).or_default().selected =
+            Some(app.storage.messages_tail(channel_id, 1)[0].arrived_at);
 
         for c in ":thumbsup:".chars() {
             app.get_input().put_char(c);
         }
-        app.add_reaction(0, None).await;
+        app.add_reaction(channel_id, None).await;
 
-        let arrived_at = app.messages[&channel_id].items[0];
+        let arrived_at = app.storage.messages_tail(channel_id, 1)[0].arrived_at;
         let reactions = &app
             .storage
             .message(MessageId::new(channel_id, arrived_at))
@@ -557,28 +595,24 @@ pub(crate) mod tests {
         assert_eq!(reactions[0], (app.user_id, "\u{1F44D}".to_string()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_remove_reaction() {
-        let (mut app, _events, _sent_messages) = test_app();
+        let (mut app, _events, _sent_messages) = test_app().await;
 
-        let channel_id = app.channels.items[0];
-        app.messages
-            .get_mut(&channel_id)
-            .unwrap()
-            .state
-            .select(Some(0));
+        let channel_id = app.channels().first().unwrap().id;
+        app.positions.entry(channel_id).or_default().selected =
+            Some(app.storage.messages_tail(channel_id, 1)[0].arrived_at);
 
-        let arrived_at = app.messages[&channel_id].items[0];
+        let arrived_at = app.storage.messages_tail(channel_id, 1)[0].arrived_at;
         let mut message = app
             .storage
             .message(MessageId::new(channel_id, arrived_at))
-            .unwrap()
-            .into_owned();
+            .unwrap();
         message
             .reactions
             .push((app.user_id, "\u{1F44D}".to_string()));
-        app.storage.store_message(channel_id, message);
-        app.add_reaction(0, None).await;
+        app.store_message(channel_id, message);
+        app.add_reaction(channel_id, None).await;
 
         let reactions = &app
             .storage
@@ -588,23 +622,21 @@ pub(crate) mod tests {
         assert!(reactions.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_add_invalid_reaction() {
-        let (mut app, _events, _sent_messages) = test_app();
-        let channel_id = app.channels.items[0];
-        app.messages
-            .get_mut(&channel_id)
-            .unwrap()
-            .state
-            .select(Some(0));
+        let (mut app, _events, _sent_messages) = test_app().await;
+
+        let channel_id = app.channels().first().unwrap().id;
+        app.positions.entry(channel_id).or_default().selected =
+            Some(app.storage.messages_tail(channel_id, 1)[0].arrived_at);
 
         for c in ":thumbsup".chars() {
             app.get_input().put_char(c);
         }
-        app.add_reaction(0, None).await;
+        app.add_reaction(channel_id, None).await;
 
         assert_eq!(app.get_input().data, ":thumbsup");
-        let arrived_at = app.messages[&channel_id].items[0];
+        let arrived_at = app.storage.messages_tail(channel_id, 1)[0].arrived_at;
         let reactions = &app
             .storage
             .message(MessageId::new(channel_id, arrived_at))

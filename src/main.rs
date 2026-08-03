@@ -1,8 +1,11 @@
 //! Signal Messenger client for terminal
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+use std::fs;
 
 use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
@@ -20,7 +23,7 @@ use gurk::{app::App, config::Config};
 use gurk::{backoff::Backoff, passphrase::Passphrase};
 use gurk::{
     onboarding,
-    storage::{MemCache, SqliteStorage, Storage, sync_from_signal},
+    storage::{SqliteStorage, Storage, sync_from_signal},
 };
 use gurk::{signal, ui};
 use presage::libsignal_service::content::Content;
@@ -55,6 +58,16 @@ struct Args {
     /// When omitted, passphrase_command is read from the env "GURK_PASSPHRASE_COMMAND".
     #[arg(long, conflicts_with = "passphrase")]
     passphrase_command: Option<String>,
+    /// Path to config file (overrides default config search paths)
+    ///
+    /// Can also be set via GURK_CONFIG environment variable.
+    #[arg(long, short, env = "GURK_CONFIG")]
+    config: Option<PathBuf>,
+    /// Path to data directory (overrides config file's data_dir)
+    ///
+    /// Can also be set via GURK_DATA_DIR environment variable.
+    #[arg(long, env = "GURK_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +88,15 @@ fn main() -> anyhow::Result<()> {
 
     log_panics::init();
 
-    let (config, passphrase) = match Config::load_installed().context("failed to load config")? {
+    let (mut config, passphrase) = match args
+        .config
+        .take()
+        .map(|p| {
+            Config::load(&p).with_context(|| format!("failed to load config from {}", p.display()))
+        })
+        .transpose()?
+        .or(Config::load_installed().context("failed to load config")?)
+    {
         Some(config) => {
             let mut config = config.report_deprecated_keys();
             let passphrase = Passphrase::get(
@@ -87,6 +108,13 @@ fn main() -> anyhow::Result<()> {
         }
         None => onboarding::run()?,
     };
+
+    // CLI --data-dir overrides config file and clears any hardcoded paths
+    if let Some(data_dir) = args.data_dir.take() {
+        config.data_dir = data_dir;
+        // Clear sqlite config so db path is derived from data_dir
+        config.sqlite = None;
+    }
 
     let runtime = runtime::Builder::new_multi_thread()
         .thread_stack_size(8 * 1024 * 1024)
@@ -118,6 +146,7 @@ pub enum Event {
 }
 
 async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Result<()> {
+    fs::create_dir_all(&config.data_dir).context("could not create data dir")?;
     let local_pool = LocalPool::new();
 
     let mut signal_manager =
@@ -138,7 +167,7 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
         let sqlite_storage = SqliteStorage::maybe_encrypt_and_open(&url, &passphrase, false)
             .await
             .with_context(|| format!("failed to open sqlite data storage at: {url}"))?;
-        Box::new(MemCache::new(sqlite_storage))
+        Box::new(sqlite_storage)
     };
 
     sync_from_signal(&*signal_manager, &mut *storage).await;
@@ -147,32 +176,7 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
     app.populate_names_cache().await;
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Event>(100);
-    // Stored reader so it can be aborted before launching an external editor
-    // (otherwise both processes compete for stdin and the editor ends up missing keystrokes).
-    let spawn_event_reader = {
-        let tx = tx.clone();
-        move || {
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let mut reader = EventStream::new().fuse();
-                while let Some(event) = reader.next().await {
-                    match event {
-                        Ok(CEvent::Key(key)) => tx.send(Event::Input(key)).await.unwrap(),
-                        Ok(CEvent::Resize(cols, rows)) => {
-                            tx.send(Event::Resize { cols, rows }).await.unwrap()
-                        }
-                        Ok(CEvent::Mouse(button)) => tx.send(Event::Click(button)).await.unwrap(),
-                        Ok(CEvent::Paste(content)) => tx.send(Event::Paste(content)).await.unwrap(),
-                        _ => (),
-                    }
-                }
-            })
-        }
-    };
-    let mut event_reader_handle = spawn_event_reader();
-
     let inner_tx = tx.clone();
-
     local_pool.spawn(move || async move {
         let mut backoff = Backoff::new();
         loop {
@@ -224,7 +228,34 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    // Clear before spawning the event reader: Terminal::clear queries the cursor position (ESC[6n)
+    // and reads the reply back from stdin. Spawned event reader consumes that reply and the query
+    // times out.
     terminal.clear()?;
+
+    // Stored reader so it can be aborted before launching an external editor (otherwise both
+    // processes compete for stdin and the editor ends up missing keystrokes).
+    let spawn_event_reader = {
+        let tx = tx.clone();
+        move || {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut reader = EventStream::new().fuse();
+                while let Some(event) = reader.next().await {
+                    match event {
+                        Ok(CEvent::Key(key)) => tx.send(Event::Input(key)).await.unwrap(),
+                        Ok(CEvent::Resize(cols, rows)) => {
+                            tx.send(Event::Resize { cols, rows }).await.unwrap()
+                        }
+                        Ok(CEvent::Mouse(button)) => tx.send(Event::Click(button)).await.unwrap(),
+                        Ok(CEvent::Paste(content)) => tx.send(Event::Paste(content)).await.unwrap(),
+                        _ => (),
+                    }
+                }
+            })
+        }
+    };
+    let mut event_reader_handle = spawn_event_reader();
 
     let mut res = Ok(()); // result on quit
     let mut last_render_at = Instant::now();
@@ -242,6 +273,8 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
             }
         }
     });
+
+    let mut expire_tick_counter: u64 = 0;
 
     loop {
         // render
@@ -263,6 +296,10 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 });
             }
         } else {
+            if app.should_clear {
+                terminal.clear()?;
+                app.should_clear = false;
+            }
             terminal.draw(|f| ui::draw(f, &mut app))?;
             last_render_at = Instant::now();
         }
@@ -275,6 +312,13 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
         match event {
             Some(Event::Tick) => {
                 app.step_receipts();
+                app.expire_typing_indicators();
+                expire_tick_counter += 1;
+                if expire_tick_counter >= 5 {
+                    expire_tick_counter = 0;
+                    app.activate_expire_timers();
+                    app.expire_messages();
+                }
             }
             Some(Event::Click(event)) => match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -285,7 +329,11 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                             .map(|(_, row)| row as usize)
                             .filter(|&idx| idx < app.channels.items.len())
                     {
+                        let old = app.selected_channel_id();
                         app.channels.state.select(Some(channel_idx));
+                        let new = app.selected_channel_id();
+                        app.swap_channel_draft(old, new);
+                        app.on_channel_changed();
                         app.reset_unread_messages();
                     }
                 }
@@ -337,9 +385,9 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 break;
             }
             Some(Event::ContactSynced(at)) => {
-                let mut metadata = app.storage.metadata().into_owned();
+                let mut metadata = app.storage.metadata();
                 metadata.contacts_sync_request_at.replace(at);
-                app.storage.store_metadata(metadata);
+                app.storage.store_metadata(&metadata);
                 info!(%at, "synced contacts");
             }
             Some(Event::AppEvent(event)) => {
@@ -351,6 +399,8 @@ async fn run(config: Config, passphrase: Passphrase, relink: bool) -> anyhow::Re
                 break;
             }
         }
+
+        app.ensure_message_window_filled();
 
         if app.open_editor_requested {
             app.open_editor_requested = false;

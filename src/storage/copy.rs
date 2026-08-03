@@ -25,13 +25,14 @@ pub async fn sync_from_signal(manager: &dyn SignalManager, storage: &mut dyn Sto
                 name =% contact.name,
                 "storing new contact from signal manager"
             );
-            storage.store_channel(Channel {
+            storage.store_channel(&Channel {
                 id: channel_id,
                 name: contact.name.trim().to_owned(),
                 group_data: None,
                 unread_messages: 0,
                 muted: false,
                 typing: TypingSet::new(false),
+                expire_timer: None,
             });
         }
     }
@@ -57,14 +58,11 @@ pub async fn sync_from_signal(manager: &dyn SignalManager, storage: &mut dyn Sto
             Some(mut channel) => {
                 let mut is_changed = false;
                 if channel.name != group.title {
-                    channel.to_mut().name = group.title;
+                    channel.name = group.title;
                     is_changed = true;
                 }
                 if channel.group_data.as_ref().map(|d| d.revision) != Some(group.revision) {
-                    let group_data = channel
-                        .to_mut()
-                        .group_data
-                        .get_or_insert_with(new_group_data);
+                    let group_data = channel.group_data.get_or_insert_with(new_group_data);
                     group_data.revision = group.revision;
                     is_changed = true;
                 }
@@ -76,27 +74,25 @@ pub async fn sync_from_signal(manager: &dyn SignalManager, storage: &mut dyn Sto
                     .flatten()
                     .ne(group.members.iter().map(|m| Uuid::from(m.aci)))
                 {
-                    let group_data = channel
-                        .to_mut()
-                        .group_data
-                        .get_or_insert_with(new_group_data);
+                    let group_data = channel.group_data.get_or_insert_with(new_group_data);
                     group_data.members = group.members.iter().map(|m| m.aci.into()).collect();
                     is_changed = true;
                 }
                 if is_changed {
                     debug!(?channel_id, "storing modified channel from signal manager");
-                    storage.store_channel(channel.into_owned());
+                    storage.store_channel(&channel);
                 }
             }
             None => {
                 debug!(?channel_id, "storing new channel from signal manager");
-                storage.store_channel(Channel {
+                storage.store_channel(&Channel {
                     id: channel_id,
                     name: group.title,
                     group_data: Some(new_group_data()),
                     unread_messages: 0,
                     muted: false,
                     typing: TypingSet::new(true),
+                    expire_timer: None,
                 });
             }
         }
